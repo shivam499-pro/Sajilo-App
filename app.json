@@ -8,10 +8,24 @@
     "scheme": "sajiloapp",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+    
+    "extra": {
+      "firebase": {
+        "apiKey": "AIzaSyATBhc1O9_tru6xdrrYxLmyjlFEgb3Tesg",
+        "authDomain" : "sajilo-app-41ce5.firebaseapp.com",
+        "projectId" : "sajilo-app-41ce5",
+        "storageBucket" : "sajilo-app-41ce5.firebasestorage.app",
+        "messagingSenderId": "1079866319176",
+        "appId" : "1:1079866319176:web:358418e404a9b82e47937d"
+      }
+    },
+
     "ios": {
       "supportsTablet": true
     },
+    
     "android": {
+      "package": "com.sajilo.delivery",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",

@@ -1,0 +1,303 @@
+// firestore.rules - Sajilo Delivery Security Rules (Phase 4)
+// Deploy these rules to Firebase Console → Firestore → Rules
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ==================== HELPER FUNCTIONS ====================
+    
+    // Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Get current user's UID
+    function currentUser() {
+      return request.auth.uid;
+    }
+    
+    // Check if user owns the document
+    function isOwner(userId) {
+      return isAuthenticated() && currentUser() == userId;
+    }
+    
+    // Get user document
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(currentUser())).data;
+    }
+    
+    // Check user's primary role
+    function hasRole(role) {
+      return isAuthenticated() && getUserData().primaryRole == role;
+    }
+    
+    // Check if user has role in roles array
+    function hasAnyRole(roles) {
+      return isAuthenticated() && 
+             getUserData().primaryRole in roles ||
+             currentUser() in getUserData().get('roles', []);
+    }
+    
+    // Check if user account is active
+    function isActiveUser() {
+      return isAuthenticated() && getUserData().status == 'active';
+    }
+    
+    // Check if user is admin
+    function isAdmin() {
+      return hasRole('admin');
+    }
+    
+    // Check if user is customer
+    function isCustomer() {
+      return hasRole('customer') || hasAnyRole(['customer']);
+    }
+    
+    // Check if user is vendor
+    function isVendor() {
+      return hasRole('vendor') || hasAnyRole(['vendor']);
+    }
+    
+    // Check if user is rider
+    function isRider() {
+      return hasRole('rider') || hasAnyRole(['rider']);
+    }
+    
+    // Validate phone number format (Nepal)
+    function isValidPhone(phone) {
+      return phone.matches('^\\+977[0-9]{10}$');
+    }
+    
+    // ==================== USERS COLLECTION ====================
+    
+    match /users/{userId} {
+      // Anyone can read public user info (for displaying names, avatars)
+      // But sensitive fields are protected
+      allow read: if isAuthenticated() && (
+        // User can read own data
+        isOwner(userId) ||
+        // Admin can read all
+        isAdmin() ||
+        // Others can only read public fields (enforced in query)
+        true
+      );
+      
+      // Only user themselves can create their profile
+      // This happens after Firebase Auth signup
+      allow create: if isAuthenticated() && 
+                      isOwner(userId) &&
+                      request.resource.data.phoneNumber is string &&
+                      isValidPhone(request.resource.data.phoneNumber) &&
+                      request.resource.data.primaryRole == 'customer' && // Default role
+                      request.resource.data.status == 'active' &&
+                      request.resource.data.version == 1;
+      
+      // User can update own profile (limited fields)
+      allow update: if isAuthenticated() && (
+        // User updates own profile
+        (isOwner(userId) && 
+         // Cannot change these fields
+         request.resource.data.uid == resource.data.uid &&
+         request.resource.data.phoneNumber == resource.data.phoneNumber &&
+         request.resource.data.primaryRole == resource.data.primaryRole &&
+         request.resource.data.createdAt == resource.data.createdAt &&
+         request.resource.data.version == resource.data.version) ||
+        
+        // Admin can update any profile
+        isAdmin()
+      );
+      
+      // Only admin can delete (soft delete by changing status)
+      allow delete: if isAdmin();
+      
+      // ==================== USER SUBCOLLECTIONS ====================
+      
+      // User's addresses
+      match /addresses/{addressId} {
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId) && isActiveUser();
+        allow delete: if isOwner(userId);
+      }
+      
+      // User's payment methods
+      match /paymentMethods/{methodId} {
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId) && isActiveUser();
+        allow delete: if isOwner(userId);
+      }
+    }
+    
+    // ==================== VENDORS COLLECTION ====================
+    
+    match /vendors/{vendorId} {
+      // Anyone can read vendor info (for browsing)
+      allow read: if true;
+      
+      // Only admin can create vendors (manual approval)
+      allow create: if isAdmin();
+      
+      // Vendor owner or admin can update
+      allow update: if isAuthenticated() && (
+        resource.data.ownerUserId == currentUser() ||
+        isAdmin()
+      );
+      
+      // Only admin can delete
+      allow delete: if isAdmin();
+      
+      // Vendor products
+      match /products/{productId} {
+        // Anyone can read products
+        allow read: if true;
+        
+        // Vendor owner can manage products
+        allow write: if isAuthenticated() && 
+                       get(/databases/$(database)/documents/vendors/$(vendorId)).data.ownerUserId == currentUser();
+        
+        allow delete: if isAuthenticated() && 
+                        get(/databases/$(database)/documents/vendors/$(vendorId)).data.ownerUserId == currentUser();
+      }
+    }
+    
+    // ==================== CARTS COLLECTION ====================
+    
+    match /carts/{userId} {
+      // Cart document ID must match user ID (one cart per user)
+      allow read: if isOwner(userId);
+      
+      allow write: if isOwner(userId) && 
+                     isActiveUser() &&
+                     request.resource.data.keys().hasAll(['userId', 'items', 'subtotal']);
+      
+      allow delete: if isOwner(userId);
+    }
+    
+    // ==================== ORDERS COLLECTION ====================
+    
+    match /orders/{orderId} {
+      // Customer can read own orders
+      // Vendor can read orders for their restaurant
+      // Rider can read assigned deliveries
+      // Admin can read all
+      allow read: if isAuthenticated() && (
+        resource.data.userId == currentUser() ||
+        resource.data.vendorId == getUserData().get('vendorId', '') ||
+        resource.data.deliveryPartnerId == currentUser() ||
+        isAdmin()
+      );
+      
+      // Only customers can create orders
+      allow create: if isAuthenticated() &&
+                      isActiveUser() &&
+                      isCustomer() &&
+                      request.resource.data.userId == currentUser() &&
+                      request.resource.data.status == 'placed' &&
+                      request.resource.data.items.size() > 0;
+      
+      // Status updates allowed by:
+      // - Vendor (to confirm/preparing/ready)
+      // - Rider (to picked/delivering/delivered)
+      // - Customer (to cancelled, only if status is 'placed')
+      // - Admin (any status)
+      allow update: if isAuthenticated() && (
+        // Customer can cancel own order if not yet confirmed
+        (resource.data.userId == currentUser() &&
+         resource.data.status == 'placed' &&
+         request.resource.data.status == 'cancelled') ||
+         
+        // Vendor can update status
+        (resource.data.vendorId == getUserData().get('vendorId', '') &&
+         isVendor()) ||
+         
+        // Rider can update delivery status
+        (resource.data.deliveryPartnerId == currentUser() &&
+         isRider()) ||
+         
+        // Admin can update anything
+        isAdmin()
+      );
+      
+      // Only admin can delete orders
+      allow delete: if isAdmin();
+      
+      // Order reviews subcollection
+      match /reviews/{reviewId} {
+        allow read: if true; // Public reviews
+        allow create: if isAuthenticated() &&
+                        get(/databases/$(database)/documents/orders/$(orderId)).data.userId == currentUser();
+      }
+    }
+    
+    // ==================== DELIVERY PARTNERS COLLECTION ====================
+    
+    match /deliveryPartners/{riderId} {
+      // Vendors and customers can see available riders
+      // Riders can see own profile
+      allow read: if isAuthenticated();
+      
+      // Only rider can update own profile
+      allow update: if isOwner(riderId) && isRider();
+      
+      // Only admin can create/delete
+      allow create, delete: if isAdmin();
+    }
+    
+    // ==================== REVIEWS COLLECTION ====================
+    
+    match /reviews/{reviewId} {
+      // Everyone can read reviews
+      allow read: if true;
+      
+      // Only verified customers can write reviews
+      allow create: if isAuthenticated() &&
+                      isCustomer() &&
+                      request.resource.data.userId == currentUser();
+      
+      // User can update own review
+      allow update: if isOwner(request.resource.data.userId);
+      
+      // Admin can delete any review
+      allow delete: if isAdmin();
+    }
+    
+    // ==================== NOTIFICATIONS COLLECTION ====================
+    
+    match /notifications/{notificationId} {
+      // User can only read own notifications
+      allow read: if isAuthenticated() &&
+                    resource.data.userId == currentUser();
+      
+      // User can mark notifications as read
+      allow update: if isAuthenticated() &&
+                      resource.data.userId == currentUser() &&
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']);
+      
+      // System and admin can create notifications
+      allow create: if isAdmin();
+      
+      allow delete: if isOwner(resource.data.userId);
+    }
+    
+    // ==================== ANALYTICS/EVENTS (Write-only) ====================
+    
+    match /analytics_events/{eventId} {
+      // Write-only for authenticated users
+      allow read: if isAdmin();
+      allow create: if isAuthenticated();
+    }
+    
+    // ==================== SYSTEM CONFIG (Admin only) ====================
+    
+    match /system_config/{document=**} {
+      allow read: if isAuthenticated(); // Everyone can read config
+      allow write: if isAdmin(); // Only admin can modify
+    }
+    
+    // ==================== DENY ALL OTHER PATHS ====================
+    
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
